@@ -1,8 +1,8 @@
 ﻿using Microsoft.Extensions.Hosting;
-
+using Microsoft.Extensions.Logging;
 using SimpleOAuthTokenFetcher.Configuration;
-
 using System.Net;
+using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -13,6 +13,7 @@ namespace SimpleOAuthTokenFetcher
     public class SimpleOAuthTokenFetcherService : IHostedService
     {
         private readonly IHttpClientFactory _httpClientFactory;
+        private ILogger<SimpleOAuthTokenFetcherService> Logger { get; }
         private OAuthClientOptions? _options;
         private string? _codeVerifier;
         private string? _lastRefreshToken;
@@ -27,9 +28,12 @@ namespace SimpleOAuthTokenFetcher
         /// OAuth token fetching process.</remarks>
         /// <param name="httpClientFactory">A factory for creating <see cref="System.Net.Http.HttpClient"/> instances. This is used to send HTTP
         /// requests for fetching OAuth tokens.</param>
-        public SimpleOAuthTokenFetcherService(IHttpClientFactory httpClientFactory)
+        /// <param name="logger"></param>
+        public SimpleOAuthTokenFetcherService(IHttpClientFactory httpClientFactory,
+            ILogger<SimpleOAuthTokenFetcherService> logger)
         {
             _httpClientFactory = httpClientFactory;
+            Logger = logger;
         }
 
         public async Task StartAsync(CancellationToken cancellationToken)
@@ -38,7 +42,7 @@ namespace SimpleOAuthTokenFetcher
             var authUrl = $"{_options.AuthorizeUrl}?response_type=code" +
                           $"&client_id={_options.ClientId}" +
                           $"&redirect_uri={Uri.EscapeDataString(_options.RedirectUri)}" +
-                          $"&scope={Uri.EscapeDataString(_options.Scope)}" +
+                          $"&scope={Uri.EscapeDataString(string.Join(" ", _options.Scopes))}" +
                           $"&state={_lastState}";
             if (_options.UsePkce)
             {
@@ -46,10 +50,10 @@ namespace SimpleOAuthTokenFetcher
                 var codeChallenge = GenerateCodeChallenge(_codeVerifier);
                 authUrl += $"&code_challenge={Uri.EscapeDataString(codeChallenge)}" +
                            $"&code_challenge_method=S256";
-                Console.WriteLine("🔐 使用 PKCE 模式");
+                Logger.LogInformation("🔐 使用 PKCE 模式");
             }
-            Console.WriteLine("\n请在浏览器中授权：");
-            Console.WriteLine(authUrl);
+            Logger.LogInformation("请在浏览器中授权：");
+            Logger.LogInformation(authUrl);
 
             try
             {
@@ -61,14 +65,14 @@ namespace SimpleOAuthTokenFetcher
             }
             catch
             {
-                Console.WriteLine("无法自动打开浏览器，请手动访问上述链接。");
+                Logger.LogWarning("无法自动打开浏览器，请手动访问上述链接。");
             }
 
             var code = await WaitForCodeFromRedirectAsync();
-            Console.WriteLine($"收到授权码：{code}");
+            Logger.LogInformation("收到授权码：{code}", code);
 
             var token = await ExchangeCodeForTokenAsync(code);
-            Console.WriteLine($"\n✅ Access Token：\n{token}");
+            Logger.LogInformation("✅ Access Token：\n{token}", token);
         }
 
         private async Task<string> WaitForCodeFromRedirectAsync()
@@ -76,7 +80,7 @@ namespace SimpleOAuthTokenFetcher
             var listener = new HttpListener();
             listener.Prefixes.Add("http://localhost:8000/auth/callback/");
             listener.Start();
-            Console.WriteLine("\n⏳ 正在等待 OAuth 回调... （使用Ctrl+C退出等待并终止应用）");
+            Logger.LogInformation("⏳ 正在等待 OAuth 回调... （使用Ctrl+C退出等待并终止应用）");
 
             var context = await listener.GetContextAsync();
             var query = HttpUtility.ParseQueryString(context.Request.Url!.Query);
@@ -84,10 +88,10 @@ namespace SimpleOAuthTokenFetcher
             var state = query.Get("state");
             if (_lastState != state)
             {
-                Console.WriteLine("❌ State 不匹配，可能是 CSRF 攻击或配置错误。请检查你的 OAuth 设置。");
+                Logger.LogError("❌ State 不匹配，可能是 CSRF 攻击或配置错误。请检查你的 OAuth 设置。");
             }
 
-            var responseHtml = "<html><body>授权成功，可关闭此窗口。</body></html>";
+            var responseHtml = "<html charset=\"utf-8\"><body>授权成功，可关闭此窗口。</body></html>";
             var buffer = Encoding.UTF8.GetBytes(responseHtml);
             context.Response.ContentLength64 = buffer.Length;
             await context.Response.OutputStream.WriteAsync(buffer);
@@ -118,12 +122,15 @@ namespace SimpleOAuthTokenFetcher
             }
 
             var content = new FormUrlEncodedContent(values);
-            var response = await client.PostAsync(_options.TokenUrl, content);
+            var requestMessage = new HttpRequestMessage(HttpMethod.Post, _options.TokenUrl);
+            requestMessage.Headers.Authorization = new AuthenticationHeaderValue("Basic", Convert.ToBase64String(Encoding.UTF8.GetBytes(_options.ClientId + ":" + _options.ClientSecret)));
+            requestMessage.Content = content;
+            var response = await client.SendAsync(requestMessage);
             var body = await response.Content.ReadAsStringAsync();
 
             if (!response.IsSuccessStatusCode)
             {
-                Console.WriteLine($"❌ 获取 Token 失败：\n{body}");
+                Logger.LogError("❌ 获取 Token 失败：\n{body}", body);
                 throw new Exception("Token 获取失败");
             }
 
@@ -131,10 +138,10 @@ namespace SimpleOAuthTokenFetcher
             var accessToken = json.RootElement.GetProperty("access_token").GetString();
             var refreshToken = json.RootElement.TryGetProperty("refresh_token", out var rt) ? rt.GetString() : null;
 
-            Console.WriteLine($"\n✅ Access Token：\n{accessToken}");
+            Logger.LogInformation("✅ Access Token：\n{accessToken}", accessToken);
             if (refreshToken != null)
             {
-                Console.WriteLine($"\n🔁 Refresh Token：\n{refreshToken}");
+                Logger.LogInformation("🔁 Refresh Token：\n{refreshToken}", refreshToken);
                 // 保存 refresh_token 可用于续期
                 _lastRefreshToken = refreshToken;
             }
@@ -178,11 +185,11 @@ namespace SimpleOAuthTokenFetcher
         {
             if (string.IsNullOrEmpty(_lastRefreshToken))
             {
-                Console.WriteLine("⚠️ 当前没有 refresh_token 可用，无法续期。");
+                Logger.LogWarning("⚠️ 当前没有 refresh_token 可用，无法续期。");
                 return;
             }
 
-            Console.WriteLine("🔄 正在使用 refresh_token 刷新 Access Token...");
+            Logger.LogInformation("🔄 正在使用 refresh_token 刷新 Access Token...");
 
             var client = _httpClientFactory.CreateClient();
             var values = new Dictionary<string, string>
@@ -203,7 +210,7 @@ namespace SimpleOAuthTokenFetcher
 
             if (!response.IsSuccessStatusCode)
             {
-                Console.WriteLine($"❌ 刷新 Token 失败：\n{body}");
+                Logger.LogError("❌ 刷新 Token 失败：\n{body}", body);
                 return;
             }
 
@@ -214,8 +221,8 @@ namespace SimpleOAuthTokenFetcher
             _lastAccessToken = accessToken;
             _lastRefreshToken = refreshToken;
 
-            Console.WriteLine($"\n✅ Access Token 已刷新：\n{accessToken}");
-            Console.WriteLine($"\n🔁 Refresh Token：\n{refreshToken}");
+            Logger.LogInformation("✅ Access Token 已刷新：\n{accessToken}", accessToken);
+            Logger.LogInformation("🔁 Refresh Token：\n{refreshToken}", refreshToken);
         }
 
         public async Task StopAsync(CancellationToken cancellationToken)

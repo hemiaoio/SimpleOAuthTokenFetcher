@@ -1,12 +1,13 @@
-﻿namespace SimpleOAuthTokenFetcher.Defaults;
+﻿namespace SimpleOAuthTokenFetcher.PlatformProfiles;
 
-public class TwitterOAuthDefaults
+public class TwitterPlatformProfile : IPlatformProfile
 {
-    public const string AuthorizeUrl = "https://x.com/i/oauth2/authorize";
-    public const string TokenUrl = "https://api.x.com/2/oauth2/token";
+    public string Name => "X";
+    public string AuthorizeUrl => "https://x.com/i/oauth2/authorize";
+    public string TokenUrl => "https://api.x.com/2/oauth2/token";
 
-    public static readonly string[] Scopes = new[]
-    {
+    public List<string> Scopes { get; } =
+    [
         "tweet.read",
         "tweet.write",
         "tweet.moderate.write",
@@ -27,5 +28,5 @@ public class TwitterOAuthDefaults
         "bookmark.read",
         "bookmark.write",
         "media.write"
-    };
+    ];
 }

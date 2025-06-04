@@ -1,11 +1,21 @@
 ﻿using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
-
+using Serilog;
 using SimpleOAuthTokenFetcher;
 using SimpleOAuthTokenFetcher.Configuration;
-using SimpleOAuthTokenFetcher.Defaults;
+using SimpleOAuthTokenFetcher.PlatformProfiles;
+using SimpleOAuthTokenFetcher.Serilog.Skin;
+using Spectre.Console;
 
+Log.Logger = new LoggerConfiguration()
+    .WriteTo.Sink(new SpectreConsoleSink())
+    .Enrich.FromLogContext()
+    .MinimumLevel.Debug()
+    .CreateLogger();
+
+Log.Logger.Information("OAuth 控制台启动中...");
 var builder = Host.CreateDefaultBuilder(args)
+    .UseSerilog() // 使用 Serilog 记录日志
     .ConfigureServices((_, services) =>
     {
         services.AddHttpClient();
@@ -13,25 +23,27 @@ var builder = Host.CreateDefaultBuilder(args)
     });
 
 using var host = builder.Build();
-var options = LoadOAuthOptionsInteractively();
+var options = LoadOAuthOptionsInteractively([
+    new TwitterPlatformProfile(),
+    new GitHubPlatformProfile(),
+    new GooglePlatformProfile(),
+    new WeChatPlatformProfile()
+]);
+Log.Logger.Information("准备使用 {Name} 平台的 ClientId: {ClientId} 请求授权", options.Name, options.ClientId);
 var service = host.Services.GetRequiredService<SimpleOAuthTokenFetcherService>();
 service.SetOptions(options);
 
-Console.WriteLine("\n你想使用哪种方式获取 Access Token？");
-Console.WriteLine("1 - 新的授权流程");
-Console.WriteLine("2 - 使用 refresh_token 刷新");
-Console.Write("请输入选项（1/2）：");
-
-var choice = Console.ReadLine()?.Trim();
-
-if (choice == "2")
+var choice = AnsiConsole.Prompt(
+    new SelectionPrompt<string>()
+        .Title("你想使用哪种方式获取 Access Token？")
+        .AddChoices("1 - 新的授权流程", "2 - 使用 [yellow]refresh_token[/] 刷新")
+);
+if (choice.StartsWith("2"))
 {
-    Console.Write("\n请输入 refresh_token：");
-    var refreshToken = Console.ReadLine()?.Trim();
-
+    var refreshToken = PromptRequired("请输入 [yellow]refresh_token[/]：");
     if (string.IsNullOrEmpty(refreshToken))
     {
-        Console.WriteLine("❌ refresh_token 不能为空，程序终止。");
+        Log.Error("❌ refresh_token 不能为空，程序终止。");
         return;
     }
 
@@ -43,160 +55,86 @@ else
     await service.StartAsync(CancellationToken.None);
 }
 
-static string[] SelectScopesInteractively(string[] scopes)
+static OAuthClientOptions LoadOAuthOptionsInteractively(List<IPlatformProfile> profiles)
 {
-    var selected = new bool[scopes.Length];
-    int current = 0;
 
-    ConsoleKey key;
-    do
+    // 添加“自定义平台”选项
+    var allProfiles = new List<IPlatformProfile>(profiles)
     {
-        Console.Clear();
-        Console.WriteLine("🔹 使用 ↑ ↓ 选择 Scope，空格切换选中，Enter 完成：\n");
-
-        for (int i = 0; i < scopes.Length; i++)
-        {
-            var prefix = (i == current ? "👉 " : "   ") + (selected[i] ? "[✔]" : "[ ]");
-            Console.WriteLine($"{prefix} {scopes[i]}");
-        }
-
-        var keyInfo = Console.ReadKey(true);
-        key = keyInfo.Key;
-
-        switch (key)
-        {
-            case ConsoleKey.UpArrow:
-                current = (current - 1 + scopes.Length) % scopes.Length;
-                break;
-            case ConsoleKey.DownArrow:
-                current = (current + 1) % scopes.Length;
-                break;
-            case ConsoleKey.Spacebar:
-                selected[current] = !selected[current];
-                break;
-        }
-
-    } while (key != ConsoleKey.Enter);
-
-    var selectedScopes = scopes
-        .Where((_, index) => selected[index])
-        .ToArray();
-
-    if (selectedScopes.Length == 0)
+        new CustomPlatformProfile()
+    };
+    var profileMap = allProfiles.ToDictionary(p => p.Name, p => p);
+    var platformName = AnsiConsole.Prompt(
+        new SelectionPrompt<string>()
+            .Title("请选择 [green]第三方平台[/]:")
+            .AddChoices(profileMap.Keys.Select(item => item.EscapeMarkup()))
+    );
+    platformName = platformName.Replace("[[", "[").Replace("]]", "]"); // 恢复原始格式
+    var platform = profileMap[platformName];
+    if (platform is CustomPlatformProfile)
     {
-        Console.WriteLine("\n⚠️ 你没有选择任何 Scope，将使用默认第一个：");
-        selectedScopes = new[] { scopes[0] };
+        return PromptCustomPlatform();
     }
+    var selectedScopes = AnsiConsole.Prompt(
+        new MultiSelectionPrompt<string>()
+            .Title("选择需要的 [green]Scopes[/]:")
+            .AddChoices(platform.Scopes)
+            .InstructionsText("[grey](↑/↓ 移动，空格选择，Enter确认)[/]")
+    );
 
-    Console.Clear();
-    Console.WriteLine("✅ 你选择了以下 Scope：\n");
-    foreach (var s in selectedScopes)
+    var clientId = PromptRequired("请输入 [yellow]ClientId[/]:");
+    var clientSecret = PromptRequired("请输入 [yellow]ClientSecret[/]:");
+    var usePkce = AnsiConsole.Prompt(
+        new SelectionPrompt<bool>()
+            .Title("是否使用 PKCE？")
+            .AddChoices(new[] { true, false })
+            .UseConverter(b => b ? "是" : "否")
+    );
+
+    return new OAuthClientOptions
     {
-        Console.WriteLine($"- {s}");
-    }
-
-    Console.WriteLine();
-
-    return selectedScopes;
+        Name = platform.Name,
+        ClientId = clientId,
+        ClientSecret = clientSecret,
+        RedirectUri = "http://localhost:8000/auth/callback",
+        Scopes = selectedScopes,
+        AuthorizeUrl = platform.AuthorizeUrl,
+        TokenUrl = platform.TokenUrl,
+        UsePkce = usePkce
+    };
 }
 
-static OAuthClientOptions LoadFromPreset(string platform, string authorizeUrl, string tokenUrl, string[] scopes)
+static OAuthClientOptions PromptCustomPlatform()
 {
-    var options = new OAuthClientOptions
+    AnsiConsole.MarkupLine("[yellow]您选择了自定义平台，请输入以下信息：[/]");
+
+    var name = PromptRequired("平台名称:");
+    var authUrl = PromptRequired("授权地址 (Auth URL):");
+    var tokenUrl = PromptRequired("令牌地址 (Token URL):");
+    var scopeInput = PromptRequired("请输入 Scope（使用空格分隔多个）:");
+    var scopes = scopeInput.Split(' ', StringSplitOptions.RemoveEmptyEntries).ToList();
+
+    var clientId = PromptRequired("请输入 [yellow]ClientId[/]:");
+    var clientSecret = PromptRequired("请输入 [yellow]ClientSecret[/]:");
+
+    return new OAuthClientOptions
     {
-        AuthorizeUrl = authorizeUrl,
+        Name = name,
+        ClientId = clientId,
+        ClientSecret = clientSecret,
+        RedirectUri = "http://localhost:8000/callback",
+        Scopes = scopes,
+        AuthorizeUrl = authUrl,
         TokenUrl = tokenUrl
     };
-
-    Console.WriteLine($"\n✅ 你选择了平台：{platform}");
-
-    // 输入 clientId 和 clientSecret
-    options.ClientId = PromptRequired("Client ID");
-    options.ClientSecret = PromptRequired("Client Secret");
-
-    var selectedScopes = SelectScopesInteractively(scopes);
-    options.Scope = string.Join(' ', selectedScopes);
-
-    Console.Write("是否启用 PKCE？(y/N): ");
-    var usePkce = Console.ReadLine()?.Trim().ToLower();
-    options.UsePkce = (usePkce == "y" || usePkce == "yes");
-
-    options.RedirectUri = "http://localhost:8000/auth/callback";
-
-    Console.WriteLine($"使用默认 Redirect URI: {options.RedirectUri}");
-    return options;
-}
-static OAuthClientOptions LoadManually()
-{
-    Console.WriteLine("\n🔧 自定义平台，请手动输入配置信息：");
-    var options = new OAuthClientOptions
-    {
-        ClientId = PromptRequired("Client ID"),
-        ClientSecret = PromptRequired("Client Secret"),
-        AuthorizeUrl = PromptRequired("Authorize URL"),
-        TokenUrl = PromptRequired("Token URL")
-    };
-
-    Console.Write("Scope（可选，默认 read）：");
-    var scope = Console.ReadLine()?.Trim();
-    if (!string.IsNullOrEmpty(scope))
-        options.Scope = scope;
-    else
-        options.Scope = "read";
-
-    options.RedirectUri = "http://localhost:8000/callback";
-    Console.WriteLine($"使用默认 Redirect URI: {options.RedirectUri}");
-    return options;
 }
 
-static OAuthClientOptions LoadOAuthOptionsInteractively()
+static string PromptRequired(string prompt)
 {
-    Console.WriteLine("请选择 OAuth 平台：");
-    Console.WriteLine("1. Google");
-    Console.WriteLine("2. GitHub");
-    Console.WriteLine("3. WeChat");
-    Console.WriteLine("4. X");
-    Console.WriteLine("0. 自定义平台");
-
-    Console.Write("请输入编号：");
-    var input = Console.ReadLine()?.Trim();
-
-    OAuthClientOptions options;
-
-    switch (input)
-    {
-        case "1":
-            options = LoadFromPreset("Google", GoogleOAuthDefaults.AuthorizeUrl, GoogleOAuthDefaults.TokenUrl, GoogleOAuthDefaults.Scopes);
-            break;
-        case "2":
-            options = LoadFromPreset("GitHub", GitHubOAuthDefaults.AuthorizeUrl, GitHubOAuthDefaults.TokenUrl, GitHubOAuthDefaults.Scopes);
-            break;
-        case "3":
-            options = LoadFromPreset("WeChat", WeChatOAuthDefaults.AuthorizeUrl, WeChatOAuthDefaults.TokenUrl, WeChatOAuthDefaults.Scopes);
-            break;
-        case "4":
-            options = LoadFromPreset("X", TwitterOAuthDefaults.AuthorizeUrl, TwitterOAuthDefaults.TokenUrl, TwitterOAuthDefaults.Scopes);
-            break;
-        default:
-            options = LoadManually();
-            break;
-    }
-
-    return options;
-}
-
-static string PromptRequired(string label)
-{
-    string? input;
-    do
-    {
-        Console.Write($"{label}: ");
-        input = Console.ReadLine()?.Trim();
-        if (string.IsNullOrEmpty(input))
-        {
-            Console.WriteLine($"❗ {label} 不能为空，请重新输入。");
-        }
-    } while (string.IsNullOrEmpty(input));
-
-    return input;
+    return AnsiConsole.Prompt(
+        new TextPrompt<string>(prompt)
+            .Validate(s => string.IsNullOrWhiteSpace(s)
+                ? ValidationResult.Error("[red]此项不能为空[/]")
+                : ValidationResult.Success())
+    );
 }
