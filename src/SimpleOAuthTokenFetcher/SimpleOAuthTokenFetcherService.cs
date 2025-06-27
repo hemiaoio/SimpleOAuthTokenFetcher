@@ -1,6 +1,8 @@
 ﻿using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using SimpleOAuthTokenFetcher.Configuration;
+using Spectre.Console;
+using System.Diagnostics;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Security.Cryptography;
@@ -38,13 +40,22 @@ namespace SimpleOAuthTokenFetcher
 
         public async Task StartAsync(CancellationToken cancellationToken)
         {
+            var code = await GetAuthorizationCodeAsync(_options);
+            Logger.LogInformation("收到授权码：{code}", code);
+
+            await ExchangeCodeForTokenAsync(code);
+        }
+
+
+        public async Task<string> GetAuthorizationCodeAsync(OAuthClientOptions options)
+        {
             _lastState = Guid.NewGuid().ToString("N");
-            var authUrl = $"{_options.AuthorizeUrl}?response_type=code" +
-                          $"&client_id={_options.ClientId}" +
-                          $"&redirect_uri={Uri.EscapeDataString(_options.RedirectUri)}" +
-                          $"&scope={Uri.EscapeDataString(string.Join(" ", _options.Scopes))}" +
+            var authUrl = $"{options.AuthorizeUrl}?response_type=code" +
+                          $"&client_id={options.ClientId}" +
+                          $"&redirect_uri={Uri.EscapeDataString(options.RedirectUri)}" +
+                          $"&scope={Uri.EscapeDataString(string.Join(" ", options.Scopes))}" +
                           $"&state={_lastState}";
-            if (_options.UsePkce)
+            if (options.UsePkce)
             {
                 _codeVerifier = GenerateCodeVerifier();
                 var codeChallenge = GenerateCodeChallenge(_codeVerifier);
@@ -52,28 +63,70 @@ namespace SimpleOAuthTokenFetcher
                            $"&code_challenge_method=S256";
                 Logger.LogInformation("🔐 使用 PKCE 模式");
             }
-            Logger.LogInformation("请在浏览器中授权：");
-            Logger.LogInformation(authUrl);
 
-            try
+            AnsiConsole.MarkupLine($"[green]请在浏览器中打开以下地址完成授权：[/]");
+            AnsiConsole.WriteLine(authUrl);
+            Process.Start(new ProcessStartInfo
             {
-                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
-                {
-                    FileName = authUrl,
-                    UseShellExecute = true
-                });
-            }
-            catch
+                FileName = authUrl,
+                UseShellExecute = true
+            });
+
+            // 判断 redirectUri 是否为 localhost 模式
+            if (IsLocalhostUri(options.RedirectUri))
             {
-                Logger.LogWarning("无法自动打开浏览器，请手动访问上述链接。");
+                return await WaitForCallbackAsync(options.RedirectUri);
             }
 
-            var code = await WaitForCodeFromRedirectAsync();
-            Logger.LogInformation("收到授权码：{code}", code);
-
-            var token = await ExchangeCodeForTokenAsync(code);
-            Logger.LogInformation("✅ Access Token：\n{token}", token);
+            return WaitForManualCode();
         }
+
+        private async Task<string> WaitForCallbackAsync(string redirectUri)
+        {
+            var uri = new Uri(redirectUri);
+            var listener = new HttpListener();
+            listener.Prefixes.Add($"{uri.Scheme}://{uri.Host}:{uri.Port}/");
+            listener.Start();
+
+            AnsiConsole.MarkupLine("[blue]正在监听回调地址... 请完成授权。[/]");
+
+            var context = await listener.GetContextAsync();
+            var code = context.Request.QueryString["code"];
+
+            // 简单反馈给浏览器
+            var responseString = "<html><body>授权成功，可以关闭此页面。</body></html>";
+            var buffer = Encoding.UTF8.GetBytes(responseString);
+            context.Response.ContentLength64 = buffer.Length;
+            await context.Response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
+            context.Response.Close();
+            listener.Stop();
+
+            return code;
+        }
+
+        private string WaitForManualCode()
+        {
+            AnsiConsole.MarkupLine("[yellow]由于 redirectUri 不是 localhost，请手动完成授权并粘贴浏览器跳转后的 URL：[/]");
+            var input = AnsiConsole.Ask<string>("请输入完整的回调地址：");
+
+            var uri = new Uri(input);
+            var query = System.Web.HttpUtility.ParseQueryString(uri.Query);
+            var code = query["code"];
+
+            if (string.IsNullOrWhiteSpace(code))
+            {
+                throw new Exception("未能从回调地址中解析出 code 参数");
+            }
+
+            return code;
+        }
+
+        private bool IsLocalhostUri(string uri)
+        {
+            return uri.StartsWith("http://localhost", StringComparison.OrdinalIgnoreCase)
+                   || uri.StartsWith("http://127.0.0.1", StringComparison.OrdinalIgnoreCase);
+        }
+
 
         private async Task<string> WaitForCodeFromRedirectAsync()
         {
@@ -137,8 +190,9 @@ namespace SimpleOAuthTokenFetcher
             using var json = JsonDocument.Parse(body);
             var accessToken = json.RootElement.GetProperty("access_token").GetString();
             var refreshToken = json.RootElement.TryGetProperty("refresh_token", out var rt) ? rt.GetString() : null;
-
+            var expire = json.RootElement.GetProperty("expires_in").GetInt32();
             Logger.LogInformation("✅ Access Token：\n{accessToken}", accessToken);
+            Logger.LogInformation("✅ Lifetime：\n{expire} Seconds", expire);
             if (refreshToken != null)
             {
                 Logger.LogInformation("🔁 Refresh Token：\n{refreshToken}", refreshToken);

@@ -25,6 +25,7 @@ var builder = Host.CreateDefaultBuilder(args)
 using var host = builder.Build();
 var options = LoadOAuthOptionsInteractively([
     new TwitterPlatformProfile(),
+    new FacebookPlatformProfile(),
     new GitHubPlatformProfile(),
     new GooglePlatformProfile(),
     new WeChatPlatformProfile()
@@ -84,6 +85,7 @@ static OAuthClientOptions LoadOAuthOptionsInteractively(List<IPlatformProfile> p
 
     var clientId = PromptRequired("请输入 [yellow]ClientId[/]:");
     var clientSecret = PromptRequired("请输入 [yellow]ClientSecret[/]:");
+    var redirectUri = PromptRequired("请输入 [yellow]RedirectUri[/]:", "http://localhost:8000/auth/callback");
     var usePkce = AnsiConsole.Prompt(
         new SelectionPrompt<bool>()
             .Title("是否使用 PKCE？")
@@ -96,7 +98,7 @@ static OAuthClientOptions LoadOAuthOptionsInteractively(List<IPlatformProfile> p
         Name = platform.Name,
         ClientId = clientId,
         ClientSecret = clientSecret,
-        RedirectUri = "http://localhost:8000/auth/callback",
+        RedirectUri = redirectUri,
         Scopes = selectedScopes,
         AuthorizeUrl = platform.AuthorizeUrl,
         TokenUrl = platform.TokenUrl,
@@ -116,25 +118,25 @@ static OAuthClientOptions PromptCustomPlatform()
 
     var clientId = PromptRequired("请输入 [yellow]ClientId[/]:");
     var clientSecret = PromptRequired("请输入 [yellow]ClientSecret[/]:");
+    var redirectUri = PromptRequired("请输入 [yellow]RedirectUri[/]:", "http://localhost:8000/auth/callback");
 
     return new OAuthClientOptions
     {
         Name = name,
         ClientId = clientId,
         ClientSecret = clientSecret,
-        RedirectUri = "http://localhost:8000/callback",
+        RedirectUri = redirectUri,
         Scopes = scopes,
         AuthorizeUrl = authUrl,
         TokenUrl = tokenUrl
     };
 }
 
-static string PromptRequired(string prompt)
+static string PromptRequired(string prompt, string? defaultValue = null)
 {
     return AnsiConsole.Prompt(
         new TextPrompt<string>(prompt)
-            .Validate(s => string.IsNullOrWhiteSpace(s)
-                ? ValidationResult.Error("[red]此项不能为空[/]")
-                : ValidationResult.Success())
+            .DefaultValue(defaultValue)
+            .ShowDefaultValue(true)
     );
 }
