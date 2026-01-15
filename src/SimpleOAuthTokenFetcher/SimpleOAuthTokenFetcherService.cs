@@ -51,10 +51,18 @@ namespace SimpleOAuthTokenFetcher
         {
             _lastState = Guid.NewGuid().ToString("N");
             var authUrl = $"{options.AuthorizeUrl}?response_type=code" +
-                          $"&client_id={options.ClientId}" +
+                          $"&{options.ClientIdParameterName}={options.ClientId}" +
                           $"&redirect_uri={Uri.EscapeDataString(options.RedirectUri)}" +
-                          $"&scope={Uri.EscapeDataString(string.Join(" ", options.Scopes))}" +
+                          $"&scope={Uri.EscapeDataString(string.Join(options.ScopeDelimiter, options.Scopes))}" +
                           $"&state={_lastState}";
+
+            // Apple requires response_mode=form_post
+            if (options.RequiresFormPost)
+            {
+                authUrl += "&response_mode=form_post";
+                Logger.LogInformation("📝 使用 response_mode=form_post (Apple)");
+            }
+
             if (options.UsePkce)
             {
                 _codeVerifier = GenerateCodeVerifier();
@@ -75,7 +83,7 @@ namespace SimpleOAuthTokenFetcher
             // 判断 redirectUri 是否为 localhost 模式
             if (IsLocalhostUri(options.RedirectUri))
             {
-                return await WaitForCallbackAsync(options.RedirectUri);
+                return await WaitForCodeFromRedirectAsync();
             }
 
             return WaitForManualCode();
@@ -85,7 +93,7 @@ namespace SimpleOAuthTokenFetcher
         {
             var uri = new Uri(redirectUri);
             var listener = new HttpListener();
-            listener.Prefixes.Add($"{uri.Scheme}://{uri.Host}:{uri.Port}/");
+            listener.Prefixes.Add($"{uri.Scheme}://{uri.Host}:{uri.Port}/auth/");
             listener.Start();
 
             AnsiConsole.MarkupLine("[blue]正在监听回调地址... 请完成授权。[/]");
@@ -124,6 +132,7 @@ namespace SimpleOAuthTokenFetcher
         private bool IsLocalhostUri(string uri)
         {
             return uri.StartsWith("http://localhost", StringComparison.OrdinalIgnoreCase)
+                   || uri.StartsWith("https://localhost", StringComparison.OrdinalIgnoreCase)
                    || uri.StartsWith("http://127.0.0.1", StringComparison.OrdinalIgnoreCase);
         }
 
@@ -131,14 +140,32 @@ namespace SimpleOAuthTokenFetcher
         private async Task<string> WaitForCodeFromRedirectAsync()
         {
             var listener = new HttpListener();
-            listener.Prefixes.Add("http://localhost:8000/auth/callback/");
+            listener.Prefixes.Add("https://localhost:8000/auth/callback/");
             listener.Start();
             Logger.LogInformation("⏳ 正在等待 OAuth 回调... （使用Ctrl+C退出等待并终止应用）");
 
             var context = await listener.GetContextAsync();
-            var query = HttpUtility.ParseQueryString(context.Request.Url!.Query);
-            var code = query.Get("code");
-            var state = query.Get("state");
+
+            string? code;
+            string? state;
+
+            // Handle both GET (query string) and POST (form data) for Apple's response_mode=form_post
+            if (context.Request.HttpMethod == "POST")
+            {
+                using var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding);
+                var body = await reader.ReadToEndAsync();
+                var formData = HttpUtility.ParseQueryString(body);
+                code = formData.Get("code");
+                state = formData.Get("state");
+                Logger.LogInformation("📥 收到 POST 回调 (Apple form_post 模式)");
+            }
+            else
+            {
+                var query = HttpUtility.ParseQueryString(context.Request.Url!.Query);
+                code = query.Get("code");
+                state = query.Get("state");
+            }
+
             if (_lastState != state)
             {
                 Logger.LogError("❌ State 不匹配，可能是 CSRF 攻击或配置错误。请检查你的 OAuth 设置。");
